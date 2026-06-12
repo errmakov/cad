@@ -1,0 +1,273 @@
+name: "cad: Dispatcher (reusable)"
+
+# The heartbeat of the pull system and the SOLE mover of cards / dispatcher of agents.
+# Agents finish their silo, mark `stage:done`, and stop; this PULLS done cards into the
+# next silo only when it's under its WIP limit (right-to-left, one hop per tick, so
+# freed capacity cascades upstream). Reusable (workflow_call): the caller (in the app
+# repo) owns the schedule/dispatch triggers + the concurrency group; this owns the logic.
+# It checks out the ENGINE (cad) for its scripts — it never touches the app code.
+
+on:
+  workflow_call:
+    inputs:
+      project_owner:
+        required: true
+        type: string
+      project_number:
+        required: true
+        type: string
+      wip_saba:
+        required: false
+        type: string
+        default: "2"
+      wip_dev:
+        required: false
+        type: string
+        default: "1"
+      wip_test:
+        required: false
+        type: string
+        default: "2"
+      board_limit:
+        required: false
+        type: string
+        default: ""
+      project_meta:
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        required: false
+        type: string
+        default: "main"
+      engine_ref:
+        required: false
+        type: string
+        default: "main"
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      PROJECT_PAT:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+env:
+  PROJECT_NUMBER: ${{ inputs.project_number }}
+  PROJECT_OWNER: ${{ inputs.project_owner }}
+  FW_PROJECT_META: ${{ inputs.project_meta }}
+  BOARD_LIMIT: ${{ inputs.board_limit }}
+  WIP_SABA: ${{ inputs.wip_saba }}
+  WIP_DEV: ${{ inputs.wip_dev }}
+  WIP_TEST: ${{ inputs.wip_test }}
+  DRY_RUN: ${{ inputs.dry_run }}
+  BASE: ${{ inputs.base_branch }}
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout engine (cad — the dispatcher scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: errmakov/cad
+          ref: ${{ inputs.engine_ref }}
+
+      - name: Poll project board
+        id: poll
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          chmod +x ./scripts/poll-board.sh
+          if ./scripts/poll-board.sh "$PROJECT_OWNER" "$PROJECT_NUMBER" > board-state.json 2> poll-err.txt; then
+            echo "--- board state ---"
+            jq -r '.[] | "  #\(.number) [\(.status)] {\(.labels | join(","))}"' board-state.json || cat board-state.json
+          else
+            echo "::warning::Board poll failed (likely GraphQL rate limit) — skipping this tick; a later tick/heartbeat will retry."
+            sed 's/^/poll-board: /' poll-err.txt >&2 || true
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Orchestrate — blocker swarm + WIP-gated pulls
+        if: steps.poll.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          chmod +x ./scripts/move-issue.sh
+
+          relabel() {  # <issue> <add|-> <remove|->
+            [ "$2" != "-" ] && gh api --method POST "repos/$REPO/issues/$1/labels" -f "labels[]=$2" >/dev/null 2>&1 || true
+            [ "$3" != "-" ] && gh api --method DELETE "repos/$REPO/issues/$1/labels/$3" >/dev/null 2>&1 || true
+            return 0
+          }
+          kick() {  # <workflow-file> [issue_number] — dispatches the app's caller via REST
+            if [ -n "${2:-}" ]; then
+              gh api --method POST "repos/$REPO/actions/workflows/$1/dispatches" -f ref="$BASE" -f "inputs[issue_number]=$2" >/dev/null 2>&1 || true
+            else
+              gh api --method POST "repos/$REPO/actions/workflows/$1/dispatches" -f ref="$BASE" >/dev/null 2>&1 || true
+            fi
+          }
+          move() { ./scripts/move-issue.sh "$PROJECT_OWNER" "$PROJECT_NUMBER" "$1" "$2" >/dev/null; }
+          count_status() { jq -r --arg s "$1" '[.[] | select(.status==$s)] | length' board-state.json; }
+
+          # ---------- 0. Human resume: `retry` cards re-enter their silo ----------
+          mapfile -t RETRY < <(jq -c '.[] | select(.labels | index("retry"))' board-state.json)
+          if [ "${#RETRY[@]}" -gt 0 ]; then
+            for item in "${RETRY[@]}"; do
+              NUM=$(echo "$item" | jq -r '.number')
+              ST=$(echo "$item" | jq -r '.status')
+              case "$ST" in
+                "SA/BA") AGENT="agent-saba.yml" ;;
+                "Dev")   AGENT="agent-dev.yml" ;;
+                "Test")  AGENT="agent-fix.yml" ;;
+                *)       AGENT="" ;;
+              esac
+              if [ -z "$AGENT" ]; then
+                echo "::warning::#$NUM has retry in silo '$ST' (no agent runs there) — clearing the flag"
+                [ "$DRY_RUN" != "true" ] && relabel "$NUM" "-" "retry"
+                continue
+              fi
+              echo "::notice::RESUME #$NUM in $ST → $AGENT"
+              if [ "$DRY_RUN" != "true" ]; then
+                relabel "$NUM" "stage:doing" "retry"
+                relabel "$NUM" "-" "blocker"
+                relabel "$NUM" "-" "needs-human"
+                gh issue comment "$NUM" --repo "$REPO" \
+                  --body "▶️ Resumed by human — re-dispatching \`${AGENT%.yml}\` in **$ST**. Swarm attempts reset." >/dev/null 2>&1 || true
+                kick "$AGENT" "$NUM"
+              fi
+            done
+            echo "Handled human resume(s); deferring normal pulls to the next tick."
+            exit 0
+          fi
+
+          # ---------- 1. Blockers present? Stop the line. Swarm the fresh ones. ----------
+          mapfile -t BLOCKED < <(jq -c '.[] | select(.labels | index("blocker"))' board-state.json)
+          if [ "${#BLOCKED[@]}" -gt 0 ]; then
+            echo "::warning::${#BLOCKED[@]} blocker(s) present — halting NEW pulls."
+            for item in "${BLOCKED[@]}"; do
+              NUM=$(echo "$item" | jq -r '.number')
+              if echo "$item" | jq -e '.labels | index("needs-human")' >/dev/null 2>&1; then
+                echo "  #$NUM awaiting a human (needs-human) — line stays stopped, not re-swarming"
+                continue
+              fi
+              if echo "$item" | jq -e '.labels | index("stage:doing")' >/dev/null 2>&1; then
+                echo "  #$NUM already being swarmed (stage:doing) — skip"
+                continue
+              fi
+              echo "::notice::Swarming blocker on #$NUM → agent-fix"
+              if [ "$DRY_RUN" != "true" ]; then
+                relabel "$NUM" "stage:doing" "-"
+                kick "agent-fix.yml" "$NUM"
+              fi
+            done
+            echo "Skipping pulls while blocked (stop starting, start finishing)."
+          else
+            # ---------- 2. Pull right-to-left, one hop/tick, WIP-gated. ----------
+            test_n=$(count_status "Test")
+            dev_n=$(count_status "Dev")
+            saba_n=$(count_status "SA/BA")
+            echo "WIP now → SA/BA:$saba_n/$WIP_SABA  Dev:$dev_n/$WIP_DEV  Test:$test_n/$WIP_TEST"
+
+            # 2-0. Test → Human Review (tests passed). Dispatcher makes this move.
+            mapfile -t C < <(jq -c '[.[] | select(.status=="Test" and (.labels|index("stage:done")))] | sort_by(.number) | .[]' board-state.json)
+            for item in "${C[@]}"; do
+              NUM=$(echo "$item" | jq -r '.number'); ID=$(echo "$item" | jq -r '.item_id')
+              echo "::notice::MOVE #$NUM  Test → Human Review (tests passed)"
+              if [ "$DRY_RUN" != "true" ]; then
+                move "$ID" "Human Review"
+                relabel "$NUM" "-" "stage:done"
+                relabel "$NUM" "-" "stage:doing"
+              fi
+              test_n=$((test_n-1))
+            done
+
+            # 2a. Test ← Dev
+            mapfile -t C < <(jq -c '[.[] | select(.status=="Dev" and (.labels|index("stage:done")) and ((.labels|index("stage:doing"))|not))] | sort_by(.number) | .[]' board-state.json)
+            for item in "${C[@]}"; do
+              [ "$test_n" -lt "$WIP_TEST" ] || { echo "Test at WIP ($WIP_TEST) — no more Dev→Test pulls"; break; }
+              NUM=$(echo "$item" | jq -r '.number'); ID=$(echo "$item" | jq -r '.item_id')
+              echo "::notice::PULL #$NUM  Dev → Test"
+              if [ "$DRY_RUN" != "true" ]; then
+                move "$ID" "Test"
+                relabel "$NUM" "stage:doing" "stage:done"
+                kick "agent-test.yml" "$NUM"
+              fi
+              test_n=$((test_n+1)); dev_n=$((dev_n-1))
+            done
+
+            # 2b. Dev ← SA/BA
+            mapfile -t C < <(jq -c '[.[] | select(.status=="SA/BA" and (.labels|index("stage:done")) and ((.labels|index("stage:doing"))|not))] | sort_by(.number) | .[]' board-state.json)
+            for item in "${C[@]}"; do
+              [ "$dev_n" -lt "$WIP_DEV" ] || { echo "Dev at WIP ($WIP_DEV) — no more SA/BA→Dev pulls"; break; }
+              NUM=$(echo "$item" | jq -r '.number'); ID=$(echo "$item" | jq -r '.item_id')
+              echo "::notice::PULL #$NUM  SA/BA → Dev"
+              if [ "$DRY_RUN" != "true" ]; then
+                move "$ID" "Dev"
+                relabel "$NUM" "stage:doing" "stage:done"
+                kick "agent-dev.yml" "$NUM"
+              fi
+              dev_n=$((dev_n+1)); saba_n=$((saba_n-1))
+            done
+
+            # 2c. SA/BA ← Ready for Work (FIFO by issue number)
+            mapfile -t C < <(jq -c '[.[] | select(.status=="Ready for Work")] | sort_by(.number) | .[]' board-state.json)
+            for item in "${C[@]}"; do
+              [ "$saba_n" -lt "$WIP_SABA" ] || { echo "SA/BA at WIP ($WIP_SABA) — no more Ready for Work→SA/BA pulls"; break; }
+              NUM=$(echo "$item" | jq -r '.number'); ID=$(echo "$item" | jq -r '.item_id')
+              echo "::notice::PULL #$NUM  Ready for Work → SA/BA"
+              if [ "$DRY_RUN" != "true" ]; then
+                move "$ID" "SA/BA"
+                relabel "$NUM" "stage:doing" "-"
+                kick "agent-saba.yml" "$NUM"
+              fi
+              saba_n=$((saba_n+1))
+            done
+          fi
+
+      - name: Notify for "Human Review" items
+        if: steps.poll.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          chmod +x ./scripts/notify-telegram.sh
+          REPO="${{ github.repository }}"
+
+          jq -c '.[] | select(.status == "Human Review")' board-state.json | while read -r item; do
+            ISSUE_NUM=$(echo "$item" | jq -r '.number')
+            TITLE=$(echo "$item" | jq -r '.title')
+
+            if echo "$item" | jq -e '.labels | index("review-notified")' >/dev/null 2>&1; then
+              echo "Already notified for #${ISSUE_NUM}, skipping"
+              continue
+            fi
+            if echo "$item" | jq -e '.labels | index("stage:doing")' >/dev/null 2>&1; then
+              echo "#${ISSUE_NUM} is being reworked (stage:doing) — not re-notifying yet"
+              continue
+            fi
+
+            echo "::notice::Sending review notification for issue #${ISSUE_NUM}"
+            if [ "$DRY_RUN" != "true" ]; then
+              PR_URL=$(gh api "repos/$REPO/pulls?head=${REPO%%/*}:agent/issue-${ISSUE_NUM}&state=open" \
+                -q '.[0].html_url // "No PR found"')
+              ./scripts/notify-telegram.sh \
+                "🔍 *Review Needed* — #${ISSUE_NUM}: *${TITLE}*\nPR: ${PR_URL}\nIssue: ${{ github.server_url }}/${REPO}/issues/${ISSUE_NUM}\n\nApprove → add the \`approved\` label · Changes → add \`changes-requested\`"
+              gh api --method POST "repos/$REPO/issues/$ISSUE_NUM/labels" -f "labels[]=review-notified" >/dev/null 2>&1 || true
+            fi
+          done
+
+      # NOTE: Deployment is intentionally NOT dispatched here. Deploy is a separate,
+      # hand-kicked batch workflow (agent-deploy) — the human controls when prod changes.
