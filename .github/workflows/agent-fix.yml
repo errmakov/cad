@@ -1,0 +1,221 @@
+name: "cad: Fix — blocker swarm (reusable)"
+
+# Station — the swarm. Dispatched on a card flagged `blocker` (tests failing). Fixes
+# in place (the card never moves backward) and re-runs the suite: green → clear blocker,
+# mark done; red → keep blocker, release for the next swarm tick, up to MAX_FIX, then
+# escalate to a human. Attempt counter derived from prior fix comments. Reusable.
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: string
+      model:
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        required: false
+        type: string
+        default: "main"
+      engine_ref:
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      PROJECT_PAT:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+env:
+  MAX_FIX: 3
+  FIX_MARKER: "Swarm fix — attempt"
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROJECT_PAT }}
+          ref: "agent/issue-${{ inputs.issue_number }}"
+
+      - name: Checkout engine (cad — prompts + scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: errmakov/cad
+          ref: ${{ inputs.engine_ref }}
+          path: engine
+
+      - name: Shield engine dir from the app's git
+        run: echo 'engine/' >> .git/info/exclude
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Determine attempt number
+        id: attempt
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          ATTEMPT=$(gh api "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/comments?per_page=100" \
+            | jq --arg fix "$FIX_MARKER" --arg res "Resumed by human" '
+                [.[].body] as $b
+                | ([ range(0; ($b|length)) | select($b[.] | contains($res)) ] | last) as $r
+                | (($r // -1) + 1) as $start
+                | ([ $b[$start:][] | select(contains($fix)) ] | length) + 1
+              ')
+          echo "attempt=$ATTEMPT" >> "$GITHUB_OUTPUT"
+          echo "Swarm attempt $ATTEMPT of $MAX_FIX"
+
+      - name: Escalate to human (attempts exhausted)
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) > fromJSON(env.MAX_FIX) }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          chmod +x engine/scripts/notify-telegram.sh || true
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=needs-human" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "🆘 **Swarm exhausted after ${MAX_FIX} attempts.** Card stays put with \`blocker\` + \`needs-human\` — the line is stopped until a human steps in and resumes it."
+          engine/scripts/notify-telegram.sh "🆘 Swarm exhausted on issue #${{ inputs.issue_number }} after ${MAX_FIX} attempts. Needs a human (line stopped)." || true
+
+      - name: Stop if escalated
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) > fromJSON(env.MAX_FIX) }}
+        run: echo "Escalated — nothing more for the swarm to do." && exit 0
+
+      - name: Record attempt
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) <= fromJSON(env.MAX_FIX) }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "🛠️ **${FIX_MARKER} ${{ steps.attempt.outputs.attempt }}/${MAX_FIX}** (automated swarm) — see [run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+
+      - name: Capture current failures
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) <= fromJSON(env.MAX_FIX) }}
+        run: |
+          set +e
+          npm run test 2>&1 | tee /tmp/fix-fail.txt
+          set -e
+
+      - name: Run Claude Code — fix
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) <= fromJSON(env.MAX_FIX) }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          MODEL="${{ inputs.model }}"; MODEL="${MODEL:-claude-opus-4-8}"
+          FAIL_OUT=$(cat /tmp/fix-fail.txt)
+          ISSUE_CONTEXT=$(engine/scripts/get-issue-context.sh "${{ github.repository }}" "${{ inputs.issue_number }}" 2>/dev/null || true)
+
+          claude -p "$(cat <<PROMPT
+          The test suite for this feature is failing and the card is blocked. Fix it.
+          The problem may be in the implementation OR in the tests. Read CLAUDE.md first.
+
+          ## Failing test output
+          \`\`\`
+          ${FAIL_OUT}
+          \`\`\`
+
+          ## Issue context
+          ${ISSUE_CONTEXT}
+
+          Make the full suite pass with \`npm run test\`. Do not weaken tests just to
+          make them pass — fix the real cause.
+          PROMPT
+          )" \
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npm install *),Bash(npm run build),Bash(npm run lint),Bash(npm run typecheck),Bash(npm run test *),Bash(npm test *),Bash(npx vitest *),Bash(git diff *),Bash(git status)" \
+            --model "$MODEL" \
+            --max-turns 30 \
+            --output-format json | tee /tmp/claude.json | jq -r '.result // empty'
+
+      - name: Report agent spend
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          [ -s /tmp/claude.json ] || exit 0
+          chmod +x engine/scripts/agent-cost.sh
+          engine/scripts/agent-cost.sh "fix" /tmp/claude.json "${{ github.repository }}" "${{ inputs.issue_number }}"
+
+      - name: Commit and push fix
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) <= fromJSON(env.MAX_FIX) }}
+        run: |
+          BRANCH="agent/issue-${{ inputs.issue_number }}"
+          git config user.name "cad-bot"
+          git config user.email "cad-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes produced this attempt"
+          else
+            git commit -m "fix: swarm attempt ${{ steps.attempt.outputs.attempt }} for #${{ inputs.issue_number }}"
+            git push origin "$BRANCH" --force-with-lease
+          fi
+
+      - name: Re-run suite — verdict
+        id: verify
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) <= fromJSON(env.MAX_FIX) }}
+        run: |
+          set +e
+          npm run test 2>&1 | tee /tmp/fix-out.txt
+          TEST_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "test_exit=$TEST_EXIT" >> "$GITHUB_OUTPUT"
+
+      - name: Green → clear blocker, hand the move to the dispatcher
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) <= fromJSON(env.MAX_FIX) && steps.verify.outputs.test_exit == '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "✅ **Swarm fixed it** (attempt ${{ steps.attempt.outputs.attempt }}). Tests green — clearing \`blocker\` and marking \`stage:done\`; the dispatcher moves it Test → Human Review on its next tick."
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/blocker" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=stage:done" >/dev/null 2>&1 || true
+          gh api --method POST "repos/${{ github.repository }}/actions/workflows/dispatcher.yml/dispatches" -f ref=${{ inputs.base_branch }} >/dev/null 2>&1 || true
+
+      - name: Red → keep blocker, release for next swarm tick
+        if: ${{ fromJSON(steps.attempt.outputs.attempt) <= fromJSON(env.MAX_FIX) && steps.verify.outputs.test_exit != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "🔁 Swarm attempt ${{ steps.attempt.outputs.attempt }} did not pass. Keeping \`blocker\`; the dispatcher will swarm again."
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=blocker" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+          gh api --method POST "repos/${{ github.repository }}/actions/workflows/dispatcher.yml/dispatches" -f ref=${{ inputs.base_branch }} >/dev/null 2>&1 || true
+
+      - name: Handle crash
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=blocker" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+          gh api --method POST "repos/${{ github.repository }}/actions/workflows/dispatcher.yml/dispatches" -f ref=${{ inputs.base_branch }} >/dev/null 2>&1 || true

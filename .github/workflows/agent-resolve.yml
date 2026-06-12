@@ -1,0 +1,198 @@
+name: "cad: Resolve — merge-conflict swarm (reusable)"
+
+# Station — dispatched by agent-deploy when an approved PR can't merge because the
+# feature branch conflicts with the base (parallel features touching the same file).
+# Merges base INTO the feature branch and resolves conflicts in place with Opus,
+# verifies the build, pushes — up to MAX_RESOLVE rounds, then escalates. The card
+# never moves; it stays in Ready to Deploy. Reusable (workflow_call).
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: string
+      model:
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        required: false
+        type: string
+        default: "main"
+      engine_ref:
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      PROJECT_PAT:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+env:
+  MAX_RESOLVE: 3
+  RESOLVE_MARKER: "Conflict resolve — attempt"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROJECT_PAT }}
+          ref: "agent/issue-${{ inputs.issue_number }}"
+
+      - name: Checkout engine (cad — prompts + scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: errmakov/cad
+          ref: ${{ inputs.engine_ref }}
+          path: engine
+
+      - name: Shield engine dir from the app's git
+        run: echo 'engine/' >> .git/info/exclude
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Determine attempt number
+        id: attempt
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          PRIOR=$(gh api "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/comments?per_page=100" \
+            -q "[.[] | select(.body | contains(\"${RESOLVE_MARKER}\"))] | length")
+          echo "n=$(( PRIOR + 1 ))" >> "$GITHUB_OUTPUT"
+          echo "Conflict-resolve attempt $(( PRIOR + 1 )) of $MAX_RESOLVE"
+
+      - name: Escalate to human (rounds exhausted)
+        if: ${{ fromJSON(steps.attempt.outputs.n) > fromJSON(env.MAX_RESOLVE) }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          chmod +x engine/scripts/notify-telegram.sh || true
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=needs-human" >/dev/null 2>&1 || true
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "🆘 **Could not auto-resolve the merge conflict after ${MAX_RESOLVE} rounds.** Card stays in Ready to Deploy with \`needs-human\` — resolve \`agent/issue-${{ inputs.issue_number }}\` against the base branch by hand, then re-run the batch deploy."
+          engine/scripts/notify-telegram.sh "🆘 Merge conflict on #${{ inputs.issue_number }} needs a human after ${MAX_RESOLVE} resolve attempts." || true
+
+      - name: Stop if escalated
+        if: ${{ fromJSON(steps.attempt.outputs.n) > fromJSON(env.MAX_RESOLVE) }}
+        run: echo "Escalated — nothing more to try." && exit 0
+
+      - name: Record attempt
+        if: ${{ fromJSON(steps.attempt.outputs.n) <= fromJSON(env.MAX_RESOLVE) }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "🧩 **${RESOLVE_MARKER} ${{ steps.attempt.outputs.n }}/${MAX_RESOLVE}** (automated) — merging the base branch into the feature branch and resolving."
+
+      - name: Merge base and resolve conflicts
+        if: ${{ fromJSON(steps.attempt.outputs.n) <= fromJSON(env.MAX_RESOLVE) }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          MODEL="${{ inputs.model }}"; MODEL="${MODEL:-claude-opus-4-8}"
+          git config user.name "cad-bot"
+          git config user.email "cad-bot@users.noreply.github.com"
+          git fetch origin ${{ inputs.base_branch }}
+
+          if git merge origin/${{ inputs.base_branch }} --no-edit; then
+            echo "Merged base cleanly — no conflict to resolve."
+          else
+            echo "Conflicts present — invoking Claude to resolve."
+            STATUS=$(git status --porcelain)
+            claude -p "$(cat <<PROMPT
+          You are resolving git merge conflicts on a feature branch after merging the
+          base branch into it. Resolve EVERY conflict so the result builds and
+          preserves BOTH the feature's intent and the base's changes (do not drop
+          either side). Read CLAUDE.md first. Edit the conflicted files to remove
+          all conflict markers. Do NOT run git commit — just leave the files fixed.
+
+          git status (porcelain):
+          ${STATUS}
+          PROMPT
+          )" \
+              --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git diff *),Bash(git status),Bash(npm run build),Bash(npm run typecheck),Bash(npm run lint)" \
+              --model "$MODEL" \
+              --max-turns 30 \
+              --output-format json | tee /tmp/claude.json | jq -r '.result // empty'
+
+            git add -A
+            if git diff --cached --quiet; then
+              echo "::error::No resolution produced by the agent"
+              exit 1
+            fi
+            git commit -m "merge: resolve conflicts with base for #${{ inputs.issue_number }}"
+          fi
+
+      - name: Report agent spend
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          [ -s /tmp/claude.json ] || exit 0
+          chmod +x engine/scripts/agent-cost.sh
+          engine/scripts/agent-cost.sh "resolve" /tmp/claude.json "${{ github.repository }}" "${{ inputs.issue_number }}"
+
+      - name: Verify build
+        id: verify
+        if: ${{ fromJSON(steps.attempt.outputs.n) <= fromJSON(env.MAX_RESOLVE) }}
+        run: |
+          set +e
+          npm run typecheck && npm run build
+          echo "ok=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Push resolved branch (success)
+        if: ${{ fromJSON(steps.attempt.outputs.n) <= fromJSON(env.MAX_RESOLVE) && steps.verify.outputs.ok == '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          git push origin "agent/issue-${{ inputs.issue_number }}"
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "✅ **Conflict resolved** (attempt ${{ steps.attempt.outputs.n }}) and the branch builds. Auto-re-running the batch deploy to ship it."
+          gh api --method POST "repos/${{ github.repository }}/actions/workflows/agent-deploy.yml/dispatches" -f ref=${{ inputs.base_branch }} >/dev/null 2>&1 || true
+
+      - name: Retry next round (build failed)
+        if: ${{ fromJSON(steps.attempt.outputs.n) <= fromJSON(env.MAX_RESOLVE) && steps.verify.outputs.ok != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "🔁 Resolve attempt ${{ steps.attempt.outputs.n }} didn't build — retrying."
+          gh api --method POST "repos/${{ github.repository }}/actions/workflows/agent-resolve.yml/dispatches" -f ref=${{ inputs.base_branch }} -f "inputs[issue_number]=${{ inputs.issue_number }}" >/dev/null 2>&1 || true
+
+      - name: Handle crash
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "⚠️ Conflict-resolve run crashed (attempt ${{ steps.attempt.outputs.n }}). See the [run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Will retry on the next deploy." || true

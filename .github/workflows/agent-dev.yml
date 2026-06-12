@@ -69,6 +69,9 @@ jobs:
           ref: ${{ inputs.engine_ref }}
           path: engine
 
+      - name: Shield engine dir from the app's git (so `git add -A` never commits it)
+        run: echo 'engine/' >> .git/info/exclude
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:

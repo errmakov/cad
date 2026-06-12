@@ -1,0 +1,306 @@
+name: "cad: Testing (reusable)"
+
+# Station 3 — Writes unit + e2e tests for the implemented feature, runs the suite.
+# Test is the rightmost value-add silo: on pass it marks done (dispatcher pulls to
+# Human Review) and best-effort sends a screenshot review album; on fail it flags
+# `blocker` so the dispatcher swarms via agent-fix. Reusable (workflow_call).
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: string
+      model:
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        required: false
+        type: string
+        default: "main"
+      engine_ref:
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      PROJECT_PAT:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout PR branch (the app feature branch)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROJECT_PAT }}
+          ref: "agent/issue-${{ inputs.issue_number }}"
+
+      - name: Checkout engine (cad — prompts + scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: errmakov/cad
+          ref: ${{ inputs.engine_ref }}
+          path: engine
+
+      - name: Shield engine dir from the app's git
+        run: echo 'engine/' >> .git/info/exclude
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          PR=$(gh api "repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:agent/issue-${{ inputs.issue_number }}&state=open" -q '.[0].number // empty')
+          echo "pr_number=$PR" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR: #${PR:-none}"
+
+      - name: Gather context
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          chmod +x engine/scripts/get-issue-context.sh
+          engine/scripts/get-issue-context.sh "${{ github.repository }}" "${{ inputs.issue_number }}" > /tmp/issue-context.md
+          if [ -n "${{ steps.pr.outputs.pr_number }}" ]; then
+            gh pr diff "${{ steps.pr.outputs.pr_number }}" --repo "${{ github.repository }}" > /tmp/pr-diff.txt 2>/dev/null || true
+          fi
+          touch /tmp/pr-diff.txt
+          echo "--- PR Diff Stats ---"; wc -l /tmp/pr-diff.txt
+
+      - name: Run Claude Code — write tests
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          MODEL="${{ inputs.model }}"; MODEL="${MODEL:-claude-sonnet-4-6}"
+          ISSUE_CONTEXT=$(cat /tmp/issue-context.md)
+          PR_DIFF=$(cat /tmp/pr-diff.txt)
+          TEST_PROMPT=$(cat engine/prompts/test-system.md)
+
+          claude -p "$(cat <<PROMPT
+          ${TEST_PROMPT}
+
+          ## Issue Context
+
+          ${ISSUE_CONTEXT}
+
+          ## PR Diff (what was implemented)
+
+          \`\`\`diff
+          ${PR_DIFF}
+          \`\`\`
+
+          ## Instructions
+
+          1. Read CLAUDE.md for project test conventions
+          2. Read the changed files to understand the implementation
+          3. Write unit tests for all new/changed functions
+          4. Write e2e tests for any new user-facing flows
+          5. Run the test suite ONCE with 'npm run test' (and 'npm run test:e2e' for e2e), then fix failures. NEVER use a watch mode (bare 'npx vitest', 'npm run test:watch') — it hangs the job.
+          PROMPT
+          )" \
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npm run test),Bash(npm run test *),Bash(npm test),Bash(npm test *),Bash(npm run test:e2e),Bash(npm run test:e2e *),Bash(npx vitest run),Bash(npx vitest run *),Bash(npx playwright test),Bash(npx playwright test *),Bash(npx playwright install),Bash(npx playwright install *),Bash(npm run lint),Bash(npm run typecheck),Bash(git diff *),Bash(git status)" \
+            --model "$MODEL" \
+            --max-turns 25 \
+            --output-format json | tee /tmp/claude.json | jq -r '.result // empty'
+
+      - name: Report agent spend
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          [ -s /tmp/claude.json ] || exit 0
+          chmod +x engine/scripts/agent-cost.sh
+          engine/scripts/agent-cost.sh "test" /tmp/claude.json "${{ github.repository }}" "${{ inputs.issue_number }}"
+
+      - name: Run test suite — verify
+        id: verify
+        run: |
+          set +e
+          npm run test 2>&1 | tee /tmp/test-output.txt
+          TEST_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "test_exit=$TEST_EXIT" >> "$GITHUB_OUTPUT"
+          if [ "$TEST_EXIT" -ne 0 ]; then echo "::warning::Tests failing (exit $TEST_EXIT)"; else echo "::notice::All tests passing"; fi
+
+      - name: Commit and push test code
+        run: |
+          BRANCH="agent/issue-${{ inputs.issue_number }}"
+          git config user.name "cad-bot"
+          git config user.email "cad-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No test changes to commit"
+          else
+            git commit -m "test: add tests for #${{ inputs.issue_number }}" -m "Automated tests by cad agent-test."
+            git push origin "$BRANCH" --force-with-lease
+          fi
+
+      - name: On pass — capture screenshots & send review album (best-effort)
+        if: steps.verify.outputs.test_exit == '0'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set +e
+          REPO="${{ github.repository }}"; ISSUE="${{ inputs.issue_number }}"
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "Telegram creds absent — skipping screenshots (dispatcher sends text)."; exit 0
+          fi
+          TITLE=$(gh api "repos/$REPO/issues/$ISSUE" -q '.title' 2>/dev/null || echo "#$ISSUE")
+          PR_URL=$(gh api "repos/$REPO/pulls?head=${{ github.repository_owner }}:agent/issue-$ISSUE&state=open" -q '.[0].html_url // ""')
+
+          # Cumulative preview: merge the deployed base into this branch so the album shows
+          # the app as it will look AFTER this card ships. Throwaway + best-effort.
+          git config user.name "cad-bot"; git config user.email "cad-bot@users.noreply.github.com"
+          git fetch origin ${{ inputs.base_branch }} >/dev/null 2>&1 || true
+          if git merge --no-ff -m "preview: cumulative screenshot for #${ISSUE}" origin/${{ inputs.base_branch }}; then
+            echo "Preview = deployed features + this card."
+          else
+            git merge --abort || true
+            echo "::notice::Merge conflict — screenshotting this feature alone (resolved for real at deploy)."
+          fi
+
+          npm run build || { echo "build failed — skipping screenshots"; exit 0; }
+          npx playwright install --with-deps chromium || npx playwright install chromium
+          npm run start > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:3000 >/dev/null 2>&1 && break; sleep 2; done
+
+          mkdir -p /tmp/shots
+          cat > _capture-shots.mjs <<'MJS'
+          import { chromium } from '@playwright/test';
+          const URL = process.env.SHOT_URL || 'http://127.0.0.1:3000';
+          const widths = [['mobile', 390, 844], ['tablet', 768, 1024], ['desktop', 1440, 900]];
+          const browser = await chromium.launch();
+          for (const [name, width, height] of widths) {
+            const page = await browser.newPage({ viewport: { width, height } });
+            try {
+              await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.waitForTimeout(1200);
+              await page.screenshot({ path: `/tmp/shots/shot-${name}.png`, fullPage: true });
+              console.log('captured', name);
+            } catch (e) { console.error('failed', name, e.message); }
+            await page.close();
+          }
+          await browser.close();
+          MJS
+          SHOT_URL=http://127.0.0.1:3000 node _capture-shots.mjs
+          kill "$SERVER_PID" 2>/dev/null || true
+          rm -f _capture-shots.mjs
+
+          shots=(); for n in mobile tablet desktop; do [ -s "/tmp/shots/shot-$n.png" ] && shots+=("/tmp/shots/shot-$n.png"); done
+          if [ "${#shots[@]}" -eq 0 ]; then echo "No screenshots — dispatcher sends text."; exit 0; fi
+
+          CAPTION=$(printf '%b' "🔍 *Review Needed* — #${ISSUE}: *${TITLE}*\nPR: ${PR_URL}\nIssue: ${{ github.server_url }}/${REPO}/issues/${ISSUE}\n\nScreens: mobile · tablet · desktop\nApprove → add the \`approved\` label · Changes → add \`changes-requested\`")
+          media='[]'; forms=(); i=0
+          for f in "${shots[@]}"; do
+            if [ "$i" -eq 0 ]; then
+              media=$(echo "$media" | jq --arg m "attach://m$i" --arg c "$CAPTION" '. + [{type:"photo",media:$m,caption:$c,parse_mode:"Markdown"}]')
+            else
+              media=$(echo "$media" | jq --arg m "attach://m$i" '. + [{type:"photo",media:$m}]')
+            fi
+            forms+=(-F "m$i=@$f"); i=$((i+1))
+          done
+          CODE=$(curl -s -o /tmp/tg.out -w '%{http_code}' \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup" \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" -F "media=${media}" "${forms[@]}")
+          if [ "$CODE" = "200" ]; then
+            gh api --method POST "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=review-notified" >/dev/null 2>&1 || true
+            echo "Review album sent (${#shots[@]} shots)."
+          else
+            echo "::warning::sendMediaGroup HTTP $CODE — dispatcher sends text fallback"; cat /tmp/tg.out 2>/dev/null || true
+          fi
+          exit 0
+
+      - name: On pass — report + mark Test done (dispatcher pulls to Human Review)
+        if: steps.verify.outputs.test_exit == '0'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          TEST_SUMMARY=$(tail -25 /tmp/test-output.txt || true)
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "$(cat <<EOF
+          ## 🧪 Test Report (automated)
+
+          All tests passing.
+
+          \`\`\`
+          ${TEST_SUMMARY}
+          \`\`\`
+
+          Marked \`stage:done\` — the dispatcher will move it to Human Review.
+
+          ---
+          _Generated by cad agent-test | $(date -u +%Y-%m-%dT%H:%M:%SZ)_
+          EOF
+          )" || true
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=stage:done" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+          gh api --method POST "repos/${{ github.repository }}/actions/workflows/dispatcher.yml/dispatches" -f ref=${{ inputs.base_branch }} >/dev/null 2>&1 || true
+
+      - name: On fail — flag blocker, stop the line
+        if: steps.verify.outputs.test_exit != '0'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          FAIL_OUT=$(tail -40 /tmp/test-output.txt || true)
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "$(cat <<EOF
+          ## 🚧 Tests failing — \`blocker\` raised (automated)
+
+          The card stays in **Test**, flagged \`blocker\`. New pulls are halted while the swarm (agent-fix) works it.
+
+          \`\`\`
+          ${FAIL_OUT}
+          \`\`\`
+
+          ---
+          _Generated by cad agent-test | $(date -u +%Y-%m-%dT%H:%M:%SZ)_
+          EOF
+          )"
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=blocker" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:done" >/dev/null 2>&1 || true
+          gh api --method POST "repos/${{ github.repository }}/actions/workflows/dispatcher.yml/dispatches" -f ref=${{ inputs.base_branch }} >/dev/null 2>&1 || true
+
+      - name: Handle failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          chmod +x engine/scripts/notify-telegram.sh || true
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=blocker" -f "labels[]=needs-human" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+          gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+            --body "⚠️ **Test agent crashed.** Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." || true
+          engine/scripts/notify-telegram.sh "⚠️ Test agent crashed for issue #${{ inputs.issue_number }}. Manual intervention needed." || true
