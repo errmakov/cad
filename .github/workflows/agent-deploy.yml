@@ -1,0 +1,217 @@
+name: "cad: Deploy — batch over Ready to Deploy (Vercel, reusable)"
+
+# The DETERMINISTIC release station — no agent/LLM here. Hand-kicked: merges every
+# approved PR sitting in "Ready to Deploy" into the base branch, deploys the result to
+# Vercel, smoke-tests that the LIVE version equals the commit just built, then moves
+# those cards to Done. A real (non-registry) conflict dispatches agent-resolve and the
+# card stays in Ready to Deploy for the next kick. Reusable (workflow_call).
+#
+# Note: CAD Console's feature registry is generated + git-ignored, so parallel feature
+# branches share no committed registry — merges are clean unless two features edit the
+# same shared file (e.g. globals.css), which is exactly what agent-resolve handles.
+
+on:
+  workflow_call:
+    inputs:
+      project_owner:
+        required: true
+        type: string
+      project_number:
+        required: true
+        type: string
+      base_branch:
+        required: false
+        type: string
+        default: "main"
+      engine_ref:
+        required: false
+        type: string
+        default: "main"
+      production_url:
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      PROJECT_PAT:
+        required: true
+      VERCEL_TOKEN:
+        required: true
+      VERCEL_ORG_ID:
+        required: true
+      VERCEL_PROJECT_ID:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  PROJECT_NUMBER: ${{ inputs.project_number }}
+  PROJECT_OWNER: ${{ inputs.project_owner }}
+  BASE: ${{ inputs.base_branch }}
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROJECT_PAT }}
+
+      - name: Checkout engine (cad — scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: errmakov/cad
+          ref: ${{ inputs.engine_ref }}
+          path: engine
+
+      - name: Shield engine dir from the app's git
+        run: echo 'engine/' >> .git/info/exclude
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install deps + Vercel CLI
+        run: |
+          npm ci
+          npm install -g vercel@latest
+
+      - name: Find items in "Ready to Deploy"
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          chmod +x engine/scripts/poll-board.sh
+          engine/scripts/poll-board.sh "$PROJECT_OWNER" "$PROJECT_NUMBER" > board-state.json
+          jq -c '[ .[] | select(.status == "Ready to Deploy") ]' board-state.json > ready.json
+          COUNT=$(jq 'length' ready.json)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "::notice::${COUNT} item(s) in Ready to Deploy"
+          cat ready.json
+
+      - name: Nothing to deploy
+        if: steps.collect.outputs.count == '0'
+        run: echo "::warning::No items in Ready to Deploy — nothing to ship."
+
+      - name: Merge approved PRs into the base branch
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          git config user.name "cad-bot"
+          git config user.email "cad-bot@users.noreply.github.com"
+          git fetch origin "$BASE"
+          git checkout "$BASE"
+          git reset --hard "origin/$BASE"
+
+          MERGED=""; FAILED=""
+          while read -r item; do
+            ISSUE=$(echo "$item" | jq -r '.number')
+            BRANCH="agent/issue-${ISSUE}"
+
+            MERGED_PR=$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" --state merged --json number -q '.[0].number // empty')
+            if [ -n "$MERGED_PR" ]; then
+              echo "PR for #${ISSUE} already merged; including"
+              MERGED="$MERGED $ISSUE"; continue
+            fi
+            OPEN_PR=$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" --state open --json number -q '.[0].number // empty')
+            if [ -z "$OPEN_PR" ]; then
+              echo "::warning::No PR for #${ISSUE}; skipping"; FAILED="$FAILED $ISSUE"; continue
+            fi
+            gh pr ready "$OPEN_PR" --repo "${{ github.repository }}" 2>/dev/null || true
+            git fetch origin "$BRANCH"
+            if git merge --no-ff -m "deploy: merge ${BRANCH} for #${ISSUE}" FETCH_HEAD; then
+              echo "Merged ${BRANCH} (#${ISSUE})"; MERGED="$MERGED $ISSUE"
+            else
+              echo "::warning::Real conflict for #${ISSUE} — dispatching agent-resolve (stays in Ready to Deploy)"
+              git merge --abort || true
+              FAILED="$FAILED $ISSUE"
+              gh api --method POST "repos/${{ github.repository }}/issues/$ISSUE/labels" -f "labels[]=redeploy-required" >/dev/null 2>&1 || true
+              gh api --method POST "repos/${{ github.repository }}/actions/workflows/agent-resolve.yml/dispatches" -f ref="$BASE" -f "inputs[issue_number]=$ISSUE" >/dev/null 2>&1 || true
+            fi
+          done < <(jq -c '.[]' ready.json)
+
+          echo "merged=${MERGED}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Merged:${MERGED:-none} | Skipped:${FAILED:-none}"
+          if [ -z "$MERGED" ]; then echo "::error::No PRs merged — aborting deploy."; exit 1; fi
+          git push origin "$BASE"
+
+      - name: Refresh base + capture SHA
+        id: refresh
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        run: |
+          git fetch origin "$BASE"
+          git checkout "$BASE"
+          git reset --hard "origin/$BASE"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build + deploy to Vercel (version-pinned)
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          GIT_SHA: ${{ steps.refresh.outputs.sha }}
+        run: |
+          vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+          # GIT_SHA is inlined by next.config.mjs at build time → /api/health reports it.
+          GIT_SHA="$GIT_SHA" vercel build --prod --token="$VERCEL_TOKEN"
+          vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN" | tee /tmp/deploy-url.txt
+          echo "::notice::Deployed $(tail -1 /tmp/deploy-url.txt)"
+
+      - name: Smoke test PRODUCTION_URL (assert live version == built SHA)
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        run: |
+          URL="${{ inputs.production_url }}"
+          if [ -z "$URL" ]; then echo "::warning::No production_url set — skipping smoke test"; exit 0; fi
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" --max-time 30)
+          if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 400 ]; then echo "::error::Smoke test failed (HTTP $CODE)"; exit 1; fi
+          EXPECT="${{ steps.refresh.outputs.sha }}"
+          # Vercel CDN can serve the prior build for a few seconds — poll briefly.
+          for i in $(seq 1 12); do
+            LIVE=$(curl -s "$URL/api/health" --max-time 30 | jq -r '.version // ""')
+            [ "$LIVE" = "$EXPECT" ] && { echo "::notice::Smoke test passed (HTTP $CODE, version ${LIVE})"; exit 0; }
+            echo "live=${LIVE:-none} != built=${EXPECT} — retry $i/12"; sleep 5
+          done
+          echo "::error::Stale deploy: live version never became '${EXPECT}'"; exit 1
+
+      - name: Move merged items to Done + close
+        if: success() && steps.collect.outputs.count != '0' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          chmod +x engine/scripts/move-issue.sh
+          BOARD_JSON=$(gh project item-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --limit 100)
+          for ISSUE in ${{ steps.merge.outputs.merged }}; do
+            ITEM_ID=$(jq -r --argjson num "$ISSUE" '.items[] | select(.content.number == $num) | .id' <<<"$BOARD_JSON")
+            if [ -n "$ITEM_ID" ] && [ "$ITEM_ID" != "null" ]; then
+              engine/scripts/move-issue.sh "$PROJECT_OWNER" "$PROJECT_NUMBER" "$ITEM_ID" "Done"
+            fi
+            gh issue close "$ISSUE" --repo "${{ github.repository }}" --comment "✅ **Batch-deployed to production.**" 2>/dev/null || true
+            gh api --method DELETE "repos/${{ github.repository }}/issues/$ISSUE/labels/review-notified" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/${{ github.repository }}/issues/$ISSUE/labels/redeploy-required" >/dev/null 2>&1 || true
+          done
+
+      - name: On failure — alert (items stay in Ready to Deploy)
+        if: failure() && inputs.dry_run != true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          chmod +x engine/scripts/notify-telegram.sh || true
+          engine/scripts/notify-telegram.sh "⚠️ Batch deploy failed. Items remain in *Ready to Deploy* — fix and re-run the deploy workflow." || true
