@@ -1,0 +1,94 @@
+name: "cad: Human Gate (label-driven, reusable)"
+
+# The human review gate. For a solo operator GitHub forbids approving your own PR, so
+# the gate is a LABEL on the issue, not a PR review:
+#   approved          → release the card to "Ready to Deploy"
+#   changes-requested → rework IN PLACE (agent-dev re-runs on the same branch; no
+#                       backward move, which would break the downstream WIP limit)
+# Reusable (workflow_call). The caller triggers on issues:labeled and filters to those
+# two labels. Checks out the engine (cad) for move-issue.sh.
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: string
+      decision:
+        required: true
+        type: string
+      project_owner:
+        required: true
+        type: string
+      project_number:
+        required: true
+        type: string
+      base_branch:
+        required: false
+        type: string
+        default: "main"
+      engine_ref:
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      PROJECT_PAT:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_NUMBER: ${{ inputs.project_number }}
+      PROJECT_OWNER: ${{ inputs.project_owner }}
+      BASE: ${{ inputs.base_branch }}
+    steps:
+      - name: Checkout engine (cad — move-issue.sh)
+        uses: actions/checkout@v4
+        with:
+          repository: errmakov/cad
+          ref: ${{ inputs.engine_ref }}
+
+      - name: Apply the human decision
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          ISSUE="${{ inputs.issue_number }}"
+          DECISION="${{ inputs.decision }}"
+          chmod +x ./scripts/move-issue.sh
+
+          ITEM_ID=$(gh project item-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --limit 100 \
+            | jq -r --argjson num "$ISSUE" '.items[] | select(.content.number == $num) | .id')
+          if [ -z "$ITEM_ID" ] || [ "$ITEM_ID" = "null" ]; then
+            echo "::warning::#$ISSUE not on the board — nothing to do"; exit 0
+          fi
+
+          if [ "$DECISION" = "approved" ]; then
+            echo "::notice::#$ISSUE approved → Ready to Deploy"
+            ./scripts/move-issue.sh "$PROJECT_OWNER" "$PROJECT_NUMBER" "$ITEM_ID" "Ready to Deploy"
+            for L in approved review-notified stage:doing stage:done; do
+              gh api --method DELETE "repos/$REPO/issues/$ISSUE/labels/$L" >/dev/null 2>&1 || true
+            done
+            gh issue comment "$ISSUE" --repo "$REPO" \
+              --body "✅ **Approved by human** → moved to Ready to Deploy. It ships on the next batch deploy."
+          else
+            echo "::notice::#$ISSUE changes-requested → rework IN PLACE (stays in Human Review)"
+            for L in changes-requested review-notified stage:done; do
+              gh api --method DELETE "repos/$REPO/issues/$ISSUE/labels/$L" >/dev/null 2>&1 || true
+            done
+            gh api --method POST "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=stage:doing" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE" --repo "$REPO" \
+              --body "🔄 **Changes requested by human.** Reworking in place — the card stays in **Human Review** (no backward move) while agent-dev addresses your feedback, then it re-requests review."
+            gh api --method POST "repos/$REPO/actions/workflows/agent-dev.yml/dispatches" \
+              -f ref="$BASE" \
+              -f "inputs[issue_number]=$ISSUE" \
+              -f "inputs[rework]=true" \
+              -f "inputs[retry_context]=Human reviewer requested changes — read the most recent issue comments for the specifics and address them." >/dev/null 2>&1 || true
+          fi
