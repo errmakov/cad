@@ -61,20 +61,19 @@ permissions:
   issues: write
   actions: write
 
-env:
-  PROJECT_NUMBER: ${{ inputs.project_number }}
-  PROJECT_OWNER: ${{ inputs.project_owner }}
-  FW_PROJECT_META: ${{ inputs.project_meta }}
-  BOARD_LIMIT: ${{ inputs.board_limit }}
-  WIP_SABA: ${{ inputs.wip_saba }}
-  WIP_DEV: ${{ inputs.wip_dev }}
-  WIP_TEST: ${{ inputs.wip_test }}
-  DRY_RUN: ${{ inputs.dry_run }}
-  BASE: ${{ inputs.base_branch }}
-
 jobs:
   tick:
     runs-on: ubuntu-latest
+    env:
+      PROJECT_NUMBER: ${{ inputs.project_number }}
+      PROJECT_OWNER: ${{ inputs.project_owner }}
+      FW_PROJECT_META: ${{ inputs.project_meta }}
+      BOARD_LIMIT: ${{ inputs.board_limit }}
+      WIP_SABA: ${{ inputs.wip_saba }}
+      WIP_DEV: ${{ inputs.wip_dev }}
+      WIP_TEST: ${{ inputs.wip_test }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      BASE: ${{ inputs.base_branch }}
     steps:
       - name: Checkout engine (cad — the dispatcher scripts)
         uses: actions/checkout@v4
