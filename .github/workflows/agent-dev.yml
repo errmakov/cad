@@ -1,0 +1,279 @@
+name: "cad: Development (reusable)"
+
+# Station 2 — Implements the feature, guided by the SA/BA analysis. Creates a
+# feature branch on the APP repo, writes code, opens a draft PR, marks done.
+#
+# Reusable (workflow_call). `github.repository` is the caller (the app repo), so
+# the branch, push, PR, and comments all target the app. Prompts + scripts come
+# from the cad engine checkout in ./engine. Model defaults to Opus (the expensive
+# station) but the caller overrides via vars.MODEL_DEV.
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: string
+      model:
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        required: false
+        type: string
+        default: "main"
+      engine_ref:
+        required: false
+        type: string
+        default: "main"
+      retry_context:
+        description: "Additional context from a retry (test failures, review feedback)"
+        required: false
+        type: string
+        default: ""
+      rework:
+        description: 'Set "true" when re-running after a human changes-requested.'
+        required: false
+        type: string
+        default: ""
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      PROJECT_PAT:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  develop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout app repo (the code being built)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROJECT_PAT }}
+
+      - name: Checkout engine (cad — prompts + scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: errmakov/cad
+          ref: ${{ inputs.engine_ref }}
+          path: engine
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Gather full context
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          chmod +x engine/scripts/get-issue-context.sh
+          engine/scripts/get-issue-context.sh "${{ github.repository }}" "${{ inputs.issue_number }}" > /tmp/issue-context.md
+          echo "--- Issue Context ---"
+          cat /tmp/issue-context.md
+
+      - name: Setup branch
+        id: branch
+        run: |
+          BRANCH="agent/issue-${{ inputs.issue_number }}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "Branch exists, checking out and pulling latest"
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH"
+          else
+            echo "Creating new branch"
+            git checkout -b "$BRANCH"
+          fi
+
+      - name: Run Claude Code — implement feature
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          MODEL="${{ inputs.model }}"; MODEL="${MODEL:-claude-opus-4-8}"
+          ISSUE_CONTEXT=$(cat /tmp/issue-context.md)
+          DEV_PROMPT=$(cat engine/prompts/dev-system.md)
+          RETRY_CONTEXT="${{ inputs.retry_context }}"
+
+          FULL_PROMPT="$(cat <<PROMPT
+          ${DEV_PROMPT}
+
+          ## Issue to Implement
+
+          ${ISSUE_CONTEXT}
+          PROMPT
+          )"
+
+          if [ -n "$RETRY_CONTEXT" ]; then
+            FULL_PROMPT="$(cat <<PROMPT
+          ${FULL_PROMPT}
+
+          ## Retry Context (fix these issues)
+
+          ${RETRY_CONTEXT}
+          PROMPT
+          )"
+          fi
+
+          claude -p "$FULL_PROMPT" \
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npm install *),Bash(npm run build),Bash(npm run lint),Bash(npm run typecheck),Bash(npm run test),Bash(git diff *),Bash(git status)" \
+            --model "$MODEL" \
+            --max-turns 30 \
+            --output-format json | tee /tmp/claude.json | jq -r '.result // empty'
+
+          # Fail fast if Claude did no work (empty output / drained credits / API error).
+          if [ ! -s /tmp/claude.json ] \
+             || [ "$(jq -r '.is_error // false' /tmp/claude.json 2>/dev/null)" = "true" ] \
+             || [ "$(jq -r '.total_cost_usd // 0' /tmp/claude.json 2>/dev/null)" = "0" ]; then
+            echo "::error::Claude produced no usable result for #${{ inputs.issue_number }} — stopping the line."
+            exit 1
+          fi
+
+      - name: Report agent spend
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          [ -s /tmp/claude.json ] || exit 0
+          chmod +x engine/scripts/agent-cost.sh
+          engine/scripts/agent-cost.sh "dev" /tmp/claude.json "${{ github.repository }}" "${{ inputs.issue_number }}"
+
+      - name: Verify build passes
+        run: |
+          npm run build 2>&1 || true
+          npm run typecheck 2>&1 || true
+          npm run lint 2>&1 || true
+
+      - name: Commit and push
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          git config user.name "cad-bot"
+          git config user.email "cad-bot@users.noreply.github.com"
+
+          # Stage first, THEN check — a fresh auto-discovered feature is all new
+          # (untracked) files; `git diff --cached` sees them, `git diff` does not.
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::warning::No changes produced by the agent"
+            exit 1
+          fi
+          git commit -m "$(cat <<'EOF'
+          feat: implement #${{ inputs.issue_number }}
+
+          Automated implementation by cad agent-dev.
+          EOF
+          )"
+          git push origin "$BRANCH" --force-with-lease
+
+      - name: Create or update PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          REPO="${{ github.repository }}"
+          OWNER="${{ github.repository_owner }}"
+          BASE="${{ inputs.base_branch }}"
+          ISSUE_TITLE=$(gh api "repos/${REPO}/issues/${{ inputs.issue_number }}" -q '.title')
+
+          EXISTING_PR=$(gh api "repos/${REPO}/pulls?head=${OWNER}:${BRANCH}&state=open" -q '.[0].number // empty')
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already exists; updated with new commits"
+            echo "pr_number=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+          else
+            PR_BODY=$(cat <<EOF
+          ## Summary
+
+          Automated implementation for #${{ inputs.issue_number }}.
+
+          See the SA/BA analysis and implementation notes in the issue comments.
+
+          ## Linked Issue
+
+          Closes #${{ inputs.issue_number }}
+
+          ---
+          _Generated by cad agent-dev_
+          EOF
+          )
+            PR_JSON=$(gh api --method POST "repos/${REPO}/pulls" \
+              -f title="feat: ${ISSUE_TITLE}" \
+              -f head="$BRANCH" \
+              -f base="$BASE" \
+              -f body="$PR_BODY" \
+              -F draft=true)
+            PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number')
+            echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "Created PR #$PR_NUMBER"
+          fi
+
+      - name: Post implementation comment
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          DIFF_STAT=$(git diff --stat "origin/${{ inputs.base_branch }}...$BRANCH" 2>/dev/null | tail -1)
+          gh issue comment "${{ inputs.issue_number }}" \
+            --repo "${{ github.repository }}" \
+            --body "$(cat <<EOF
+          ## 🔨 Implementation Complete (automated)
+
+          - **Branch**: \`${BRANCH}\`
+          - **PR**: #${{ steps.pr.outputs.pr_number }}
+          - **Changes**: ${DIFF_STAT}
+
+          Dev complete — card marked \`stage:done\`, awaiting pull into Test.
+
+          ---
+          _Generated by cad agent-dev | $(date -u +%Y-%m-%dT%H:%M:%SZ)_
+          EOF
+          )"
+
+      - name: Mark done + advance (Dev->Test pull, or re-review after rework)
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          if [ -n "${{ inputs.rework }}" ]; then
+            gh issue comment "${{ inputs.issue_number }}" --repo "${{ github.repository }}" \
+              --body "🔧 Rework pushed — re-running tests before re-review." >/dev/null 2>&1 || true
+            gh api --method POST "repos/${{ github.repository }}/actions/workflows/agent-test.yml/dispatches" -f ref=${{ inputs.base_branch }} -f "inputs[issue_number]=${{ inputs.issue_number }}" >/dev/null 2>&1 || true
+          else
+            gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=stage:done" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+            gh api --method POST "repos/${{ github.repository }}/actions/workflows/dispatcher.yml/dispatches" -f ref=${{ inputs.base_branch }} >/dev/null 2>&1 || true
+          fi
+
+      - name: Handle failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          chmod +x engine/scripts/notify-telegram.sh || true
+          gh api --method POST "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels" -f "labels[]=blocker" -f "labels[]=needs-human" >/dev/null 2>&1 || true
+          gh api --method DELETE "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}/labels/stage:doing" >/dev/null 2>&1 || true
+          gh issue comment "${{ inputs.issue_number }}" \
+            --repo "${{ github.repository }}" \
+            --body "⚠️ **Development agent failed.** Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." || true
+          engine/scripts/notify-telegram.sh "⚠️ Dev agent failed for issue #${{ inputs.issue_number }}. Needs manual attention." || true
