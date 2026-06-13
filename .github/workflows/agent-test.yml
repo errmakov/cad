@@ -188,6 +188,15 @@ jobs:
             echo "::notice::Merge conflict — screenshotting this feature alone (resolved for real at deploy)."
           fi
 
+          # Preview data: if the app ships a sample fixture, seed it so the screenshots
+          # render WITH realistic data — otherwise new widgets draw nothing on a clean
+          # slate. The live app is unaffected (lib reads data/pipeline.json only at
+          # runtime, and that file is gitignored, so this is throwaway/CI-only).
+          if [ -f data/pipeline.sample.json ]; then
+            cp data/pipeline.sample.json data/pipeline.json
+            echo "Seeded data/pipeline.json from sample for the preview screenshots."
+          fi
+
           npm run build || { echo "build failed — skipping screenshots"; exit 0; }
           npx playwright install --with-deps chromium || npx playwright install chromium
           npm run start > /tmp/server.log 2>&1 &
