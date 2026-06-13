@@ -62,10 +62,11 @@ jobs:
           REPO="${{ github.repository }}"
           ISSUE="${{ inputs.issue_number }}"
           DECISION="${{ inputs.decision }}"
-          chmod +x ./scripts/move-issue.sh
+          chmod +x ./scripts/move-issue.sh ./scripts/poll-board.sh
 
-          ITEM_ID=$(gh project item-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --limit 100 \
-            | jq -r --argjson num "$ISSUE" '.items[] | select(.content.number == $num) | .id')
+          # Lean board read (same as the dispatcher) instead of the fat item-list.
+          ITEM_ID=$(./scripts/poll-board.sh "$PROJECT_OWNER" "$PROJECT_NUMBER" \
+            | jq -r --argjson num "$ISSUE" '.[] | select(.number == $num) | .item_id')
           if [ -z "$ITEM_ID" ] || [ "$ITEM_ID" = "null" ]; then
             echo "::warning::#$ISSUE not on the board — nothing to do"; exit 0
           fi

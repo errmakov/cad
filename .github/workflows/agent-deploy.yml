@@ -194,10 +194,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PROJECT_PAT }}
         run: |
-          chmod +x engine/scripts/move-issue.sh
-          BOARD_JSON=$(gh project item-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --limit 100)
+          chmod +x engine/scripts/move-issue.sh engine/scripts/poll-board.sh
+          # Lean board read (same as the dispatcher) instead of the fat item-list.
+          BOARD_JSON=$(engine/scripts/poll-board.sh "$PROJECT_OWNER" "$PROJECT_NUMBER")
           for ISSUE in ${{ steps.merge.outputs.merged }}; do
-            ITEM_ID=$(jq -r --argjson num "$ISSUE" '.items[] | select(.content.number == $num) | .id' <<<"$BOARD_JSON")
+            ITEM_ID=$(jq -r --argjson num "$ISSUE" '.[] | select(.number == $num) | .item_id' <<<"$BOARD_JSON")
             if [ -n "$ITEM_ID" ] && [ "$ITEM_ID" != "null" ]; then
               engine/scripts/move-issue.sh "$PROJECT_OWNER" "$PROJECT_NUMBER" "$ITEM_ID" "Done"
             fi
