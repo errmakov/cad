@@ -1,10 +1,16 @@
-name: "cad: Deploy — batch over Ready to Deploy (Vercel, reusable)"
+name: "cad: Deploy — batch over Ready to Deploy (self-hosted Docker, reusable)"
 
 # The DETERMINISTIC release station — no agent/LLM here. Hand-kicked: merges every
-# approved PR sitting in "Ready to Deploy" into the base branch, deploys the result to
-# Vercel, smoke-tests that the LIVE version equals the commit just built, then moves
+# approved PR sitting in "Ready to Deploy" into the base branch, builds ONE Docker image
+# from the merged base, pushes it to GHCR, deploys it to the VPS over SSH (docker compose
+# pull + up), smoke-tests that the LIVE version equals the commit just built, then moves
 # those cards to Done. A real (non-registry) conflict dispatches agent-resolve and the
 # card stays in Ready to Deploy for the next kick. Reusable (workflow_call).
+#
+# Self-hosted (contro.lol / factorywall pattern) — replaces the old Vercel path, whose
+# Hobby-queue stalls made recorded demos unreliable. The app repo must ship a Dockerfile
+# (Next.js `output: standalone`) and a docker-compose.prod.yml; the VPS already runs
+# Docker + a reverse proxy that fronts the chosen port with TLS.
 #
 # Note: CAD Console's feature registry is generated + git-ignored, so parallel feature
 # branches share no committed registry — merges are clean unless two features edit the
@@ -35,14 +41,36 @@ on:
         required: false
         type: boolean
         default: false
+      # --- self-hosted deploy target ---
+      image_name:
+        required: false
+        type: string
+        default: "cad-console"
+      container_name:
+        required: false
+        type: string
+        default: "cad-console"
+      external_port:
+        required: false
+        type: string
+        default: "3501"
+      deploy_path:
+        required: true
+        type: string
+      vps_host:
+        required: true
+        type: string
+      vps_username:
+        required: true
+        type: string
+      vps_port:
+        required: false
+        type: string
+        default: "22"
     secrets:
       PROJECT_PAT:
         required: true
-      VERCEL_TOKEN:
-        required: true
-      VERCEL_ORG_ID:
-        required: true
-      VERCEL_PROJECT_ID:
+      VPS_SSH_KEY:
         required: true
       TELEGRAM_BOT_TOKEN:
         required: false
@@ -53,6 +81,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  packages: write
 
 jobs:
   release:
@@ -62,8 +91,7 @@ jobs:
       PROJECT_NUMBER: ${{ inputs.project_number }}
       PROJECT_OWNER: ${{ inputs.project_owner }}
       BASE: ${{ inputs.base_branch }}
-      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}
     steps:
       - name: Checkout app repo
         uses: actions/checkout@v4
@@ -80,16 +108,6 @@ jobs:
 
       - name: Shield engine dir from the app's git
         run: echo 'engine/' >> .git/info/exclude
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install deps + Vercel CLI
-        run: |
-          npm ci
-          npm install -g vercel@latest
 
       - name: Find items in "Ready to Deploy"
         id: collect
@@ -161,17 +179,119 @@ jobs:
           git reset --hard "origin/$BASE"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Build + deploy to Vercel (version-pinned)
+      - name: Set up Docker Buildx
         if: steps.collect.outputs.count != '0' && inputs.dry_run != true
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          GIT_SHA: ${{ steps.refresh.outputs.sha }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.refresh.outputs.sha }}
+          build-args: |
+            GIT_SHA=${{ steps.refresh.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create env files for the VPS
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
         run: |
-          vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
-          # GIT_SHA is inlined by next.config.mjs at build time → /api/health reports it.
-          GIT_SHA="$GIT_SHA" vercel build --prod --token="$VERCEL_TOKEN"
-          vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN" | tee /tmp/deploy-url.txt
-          echo "::notice::Deployed $(tail -1 /tmp/deploy-url.txt)"
+          # .env — consumed by docker compose for variable substitution (image/port/name).
+          cat > .env <<ENVEOF
+          GITHUB_REPOSITORY_OWNER=${{ github.repository_owner }}
+          CAD_CONSOLE_IMAGE=${{ inputs.image_name }}
+          CAD_CONSOLE_CONTAINER=${{ inputs.container_name }}
+          CAD_CONSOLE_EXTERNAL_PORT=${{ inputs.external_port }}
+          ENVEOF
+          sed -i 's/^[[:space:]]*//' .env
+
+          # .env.production — runtime env inside the container. GITHUB_TOKEN is the read
+          # PAT the self-observing dashboard uses for the live board fetch (lib/github.ts).
+          cat > .env.production <<ENVEOF
+          NODE_ENV=production
+          PORT=3000
+          GITHUB_TOKEN=${{ secrets.PROJECT_PAT }}
+          PROJECT_OWNER=${{ inputs.project_owner }}
+          PROJECT_NUMBER=${{ inputs.project_number }}
+          ENVEOF
+          sed -i 's/^[[:space:]]*//' .env.production
+
+      - name: Copy compose + env to VPS
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ inputs.vps_host }}
+          username: ${{ inputs.vps_username }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ inputs.vps_port }}
+          source: "docker-compose.prod.yml,.env,.env.production"
+          target: "${{ inputs.deploy_path }}"
+          overwrite: true
+
+      - name: Deploy on VPS
+        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ inputs.vps_host }}
+          username: ${{ inputs.vps_username }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ inputs.vps_port }}
+          command_timeout: 10m
+          script: |
+            cd ${{ inputs.deploy_path }}
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d
+            docker image prune -af
+
+            container="${{ inputs.container_name }}"
+            echo "Waiting for ${container} to become healthy..."
+            for i in $(seq 1 18); do
+              status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "missing")
+              health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$container" 2>/dev/null || echo "unknown")
+
+              if [ "$status" != "running" ]; then
+                echo "FATAL: ${container} is not running (status: ${status})"
+                docker logs --tail 40 "$container" 2>&1 || true
+                exit 1
+              fi
+
+              if [ "$health" = "healthy" ] || [ "$health" = "no-healthcheck" ]; then
+                echo "${container} is up (health: ${health})"
+                break
+              fi
+
+              if [ "$health" = "unhealthy" ]; then
+                echo "FATAL: ${container} is unhealthy"
+                docker logs --tail 40 "$container" 2>&1 || true
+                exit 1
+              fi
+
+              if [ "$i" -eq 18 ]; then
+                echo "FATAL: ${container} did not become healthy within 90s (health: ${health})"
+                docker logs --tail 40 "$container" 2>&1 || true
+                exit 1
+              fi
+
+              sleep 5
+            done
+
+            docker compose -f docker-compose.prod.yml ps
 
       - name: Smoke test PRODUCTION_URL (assert live version == built SHA)
         if: steps.collect.outputs.count != '0' && inputs.dry_run != true
@@ -181,7 +301,7 @@ jobs:
           CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" --max-time 30)
           if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 400 ]; then echo "::error::Smoke test failed (HTTP $CODE)"; exit 1; fi
           EXPECT="${{ steps.refresh.outputs.sha }}"
-          # Vercel CDN can serve the prior build for a few seconds — poll briefly.
+          # The container may still be warming behind the proxy — poll briefly.
           for i in $(seq 1 12); do
             LIVE=$(curl -s "$URL/api/health" --max-time 30 | jq -r '.version // ""')
             [ "$LIVE" = "$EXPECT" ] && { echo "::notice::Smoke test passed (HTTP $CODE, version ${LIVE})"; exit 0; }
