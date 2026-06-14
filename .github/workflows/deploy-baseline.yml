@@ -1,8 +1,9 @@
-name: "cad: Deploy baseline (Vercel, reusable)"
+name: "cad: Deploy baseline (self-hosted Docker, reusable)"
 
 # Restore production to the clean baseline app. reset-rehearsal force-resets the app's
-# base branch to the `baseline` tag, then triggers this to redeploy that clean commit —
-# so each rehearsal starts from an identical live app. No board ops, no merges. Reusable.
+# base branch to the `baseline` tag, then triggers this to rebuild + redeploy that clean
+# commit to the VPS — so each rehearsal starts from an identical live app. No board ops,
+# no merges. Reusable. (Self-hosted; replaces the old Vercel path.)
 
 on:
   workflow_call:
@@ -11,34 +12,51 @@ on:
         required: false
         type: string
         default: "main"
-      engine_ref:
-        required: false
-        type: string
-        default: "main"
       production_url:
         required: false
         type: string
         default: ""
+      image_name:
+        required: false
+        type: string
+        default: "cad-console"
+      container_name:
+        required: false
+        type: string
+        default: "cad-console"
+      external_port:
+        required: false
+        type: string
+        default: "3501"
+      deploy_path:
+        required: true
+        type: string
+      vps_host:
+        required: true
+        type: string
+      vps_username:
+        required: true
+        type: string
+      vps_port:
+        required: false
+        type: string
+        default: "22"
     secrets:
       PROJECT_PAT:
         required: true
-      VERCEL_TOKEN:
-        required: true
-      VERCEL_ORG_ID:
-        required: true
-      VERCEL_PROJECT_ID:
+      VPS_SSH_KEY:
         required: true
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   baseline:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}
     steps:
       - name: Checkout app at the (reset) base branch
         uses: actions/checkout@v4
@@ -46,29 +64,109 @@ jobs:
           ref: ${{ inputs.base_branch }}
           token: ${{ secrets.PROJECT_PAT }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install deps + Vercel CLI
-        run: |
-          npm ci
-          npm install -g vercel@latest
-
       - name: Capture SHA
         id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Build + deploy baseline to Vercel
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          GIT_SHA: ${{ steps.sha.outputs.sha }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push baseline image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # :latest is what the VPS pulls; :baseline is an immutable marker for the clean
+          # scaffold; :<sha> ties the live /api/health version to this exact commit.
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:baseline
+            ${{ env.IMAGE }}:${{ steps.sha.outputs.sha }}
+          build-args: |
+            GIT_SHA=${{ steps.sha.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create env files for the VPS
         run: |
-          vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
-          GIT_SHA="$GIT_SHA" vercel build --prod --token="$VERCEL_TOKEN"
-          vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN" | tee /tmp/deploy-url.txt
-          echo "::notice::Baseline deployed $(tail -1 /tmp/deploy-url.txt)"
+          cat > .env <<ENVEOF
+          GITHUB_REPOSITORY_OWNER=${{ github.repository_owner }}
+          CAD_CONSOLE_IMAGE=${{ inputs.image_name }}
+          CAD_CONSOLE_CONTAINER=${{ inputs.container_name }}
+          CAD_CONSOLE_EXTERNAL_PORT=${{ inputs.external_port }}
+          ENVEOF
+          sed -i 's/^[[:space:]]*//' .env
+
+          cat > .env.production <<ENVEOF
+          NODE_ENV=production
+          PORT=3000
+          GITHUB_TOKEN=${{ secrets.PROJECT_PAT }}
+          PROJECT_OWNER=${{ github.repository_owner }}
+          ENVEOF
+          sed -i 's/^[[:space:]]*//' .env.production
+
+      - name: Copy compose + env to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ inputs.vps_host }}
+          username: ${{ inputs.vps_username }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ inputs.vps_port }}
+          source: "docker-compose.prod.yml,.env,.env.production"
+          target: "${{ inputs.deploy_path }}"
+          overwrite: true
+
+      - name: Deploy baseline on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ inputs.vps_host }}
+          username: ${{ inputs.vps_username }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ inputs.vps_port }}
+          command_timeout: 10m
+          script: |
+            cd ${{ inputs.deploy_path }}
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d
+            docker image prune -af
+
+            container="${{ inputs.container_name }}"
+            echo "Waiting for ${container} to become healthy..."
+            for i in $(seq 1 18); do
+              status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "missing")
+              health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$container" 2>/dev/null || echo "unknown")
+              if [ "$status" != "running" ]; then
+                echo "FATAL: ${container} is not running (status: ${status})"
+                docker logs --tail 40 "$container" 2>&1 || true
+                exit 1
+              fi
+              if [ "$health" = "healthy" ] || [ "$health" = "no-healthcheck" ]; then
+                echo "${container} is up (health: ${health})"; break
+              fi
+              if [ "$health" = "unhealthy" ]; then
+                echo "FATAL: ${container} is unhealthy"
+                docker logs --tail 40 "$container" 2>&1 || true
+                exit 1
+              fi
+              if [ "$i" -eq 18 ]; then
+                echo "FATAL: ${container} did not become healthy within 90s (health: ${health})"
+                docker logs --tail 40 "$container" 2>&1 || true
+                exit 1
+              fi
+              sleep 5
+            done
+            docker compose -f docker-compose.prod.yml ps
 
       - name: Smoke test (assert live version == baseline SHA)
         run: |
