@@ -127,7 +127,7 @@ jobs:
         run: echo "::warning::No items in Ready to Deploy — nothing to ship."
 
       - name: Merge approved PRs into the base branch
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: ${{ steps.collect.outputs.count != '0' && inputs.dry_run != true }}
         id: merge
         env:
           GH_TOKEN: ${{ secrets.PROJECT_PAT }}
@@ -167,24 +167,52 @@ jobs:
 
           echo "merged=${MERGED}" >> "$GITHUB_OUTPUT"
           echo "::notice::Merged:${MERGED:-none} | Skipped:${FAILED:-none}"
-          if [ -z "$MERGED" ]; then echo "::error::No PRs merged — aborting deploy."; exit 1; fi
+          # Nothing merged is NOT a failure when every card conflicted: the resolvers were
+          # already dispatched and the cards stay in Ready to Deploy. Exit green and let the
+          # downstream build/deploy steps skip (they gate on steps.merge.outputs.merged).
+          if [ -z "$MERGED" ]; then
+            if [ -n "$FAILED" ]; then
+              echo "::notice::Nothing merged this round — conflict(s) on${FAILED} dispatched to agent-resolve. Re-kick the deploy once they land; cards stay in Ready to Deploy."
+            else
+              echo "::warning::Nothing merged and no open PRs for the Ready-to-Deploy items — nothing to ship."
+            fi
+            exit 0
+          fi
           git push origin "$BASE"
 
       - name: Refresh base + capture SHA
         id: refresh
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
         run: |
           git fetch origin "$BASE"
           git checkout "$BASE"
           git reset --hard "origin/$BASE"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Run app pre-build hook (optional — e.g. bake a data snapshot)
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          # Generic extension point: if the APP ships scripts/deploy-prebuild.sh, run it in
+          # the app checkout just before the image build. The engine stays app-agnostic; the
+          # app decides what (if anything) to bake in (cad-console writes data/cost.json from
+          # the FW_COST run-log telemetry — its own dashboard data contract, not the engine's).
+          rm -f data/pipeline.json   # never let a stale preview file shadow the live feed
+          if [ -x scripts/deploy-prebuild.sh ]; then
+            echo "::notice::Running app pre-build hook: scripts/deploy-prebuild.sh"
+            scripts/deploy-prebuild.sh "$PROJECT_OWNER" "${GITHUB_REPOSITORY#*/}" \
+              || echo "::warning::pre-build hook failed — shipping without its data"
+          else
+            echo "No scripts/deploy-prebuild.sh in the app — skipping."
+          fi
+
       - name: Set up Docker Buildx
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -192,7 +220,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -207,7 +235,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Create env files for the VPS
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
         run: |
           # .env — consumed by docker compose for variable substitution (image/port/name).
           cat > .env <<ENVEOF
@@ -230,7 +258,7 @@ jobs:
           sed -i 's/^[[:space:]]*//' .env.production
 
       - name: Copy compose + env to VPS
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ inputs.vps_host }}
@@ -242,7 +270,7 @@ jobs:
           overwrite: true
 
       - name: Deploy on VPS
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ inputs.vps_host }}
@@ -294,7 +322,7 @@ jobs:
             docker compose -f docker-compose.prod.yml ps
 
       - name: Smoke test PRODUCTION_URL (assert live version == built SHA)
-        if: steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: steps.merge.outputs.merged != '' && inputs.dry_run != true
         run: |
           URL="${{ inputs.production_url }}"
           if [ -z "$URL" ]; then echo "::warning::No production_url set — skipping smoke test"; exit 0; fi
@@ -310,7 +338,7 @@ jobs:
           echo "::error::Stale deploy: live version never became '${EXPECT}'"; exit 1
 
       - name: Move merged items to Done + close
-        if: success() && steps.collect.outputs.count != '0' && inputs.dry_run != true
+        if: success() && steps.merge.outputs.merged != '' && inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.PROJECT_PAT }}
         run: |

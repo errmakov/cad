@@ -54,6 +54,11 @@ Produce your analysis in this exact markdown structure:
 - Be **specific** — reference actual file paths, function names, and line numbers from the codebase
 - Be **concise** — the developer agent will read every word, don't pad with fluff
 - Be **conservative** — prefer minimal changes over large refactors
+- **Keep the change merge-isolated** — parallel cards merge together at deploy, so scope
+  new code into the feature's own folder and avoid directing changes into shared files
+  every feature touches (e.g. a global stylesheet). For UI work, the feature's styles
+  belong in its own co-located CSS Module, not in `app/globals.css`. Reflect this in
+  *Affected Files* (point at `features/<name>/…`, not the global stylesheet).
 - If the issue is unclear or ambiguous, note what assumptions you're making
 - If the issue seems too large for a single PR, suggest how to break it down
 - Don't write code — that's the developer agent's job. Describe what to do, not how to write it.

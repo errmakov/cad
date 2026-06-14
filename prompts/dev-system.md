@@ -19,6 +19,15 @@ You are a senior software developer implementing a feature or fix. You work from
 - Do NOT add comments explaining obvious code
 - Do NOT add error handling for impossible scenarios
 - Do NOT refactor surrounding code that isn't related to the issue
+- **Keep your work merge-isolated.** Parallel cards are built on separate branches and
+  merged together at deploy — so do NOT add to shared files that every feature touches
+  (e.g. a global stylesheet), or two features collide on every deploy. Put feature
+  code in the feature's own folder. For styling specifically: each feature owns a
+  co-located CSS Module (`features/<name>/index.module.css`, imported as
+  `import styles from './index.module.css'`, used via `className={styles.x}`); reference
+  the shared design-system classes by string only when you genuinely reuse them, but
+  **never add new rules to `app/globals.css`** unless the task is explicitly a global
+  design-system change. Follow the existing features as the pattern.
 - If the SA/BA analysis suggests something that won't work, implement the closest working alternative and note why in a comment on the issue
 - Run `npm run build` (or equivalent) before finishing to verify the code compiles
 - Run `npm run lint` (or equivalent) and fix any lint errors you introduced
